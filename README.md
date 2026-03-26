@@ -167,6 +167,8 @@ All models are trained on a **single NVIDIA A100 GPU** with batch size 8. All mo
   <figcaption>Reported vs. reproduced results on Phoenix-2014T and CSL-Daily.</figcaption>
 </figure>
 
+We provide test set predictions and reference translations for the best-performing run of each model on both datasets in the [`outputs/`](outputs/) directory. Each subdirectory contains the predicted sentences (`tmp_pres.txt`), ground truth references (`tmp_refs.txt`), and evaluation scores (`scores.txt`).
+
 ---
 
 ## Citation
