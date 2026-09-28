@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE/cache
+.vscode/
+.idea/
+.cache/
+
+# Logs
+*.log
+
+# Training outputs
+outputs/
+checkpoints/
+runs/
+wandb/
+
+# Model binaries
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# Dataset/database files
+*.lmdb
+data.mdb
+lock.mdb
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Machine-specific external assets (prevent accidental tracking if copied or linked inside repo)
+mbart_models/
+iSign_LMDB/
+iSign_Checkpoints/

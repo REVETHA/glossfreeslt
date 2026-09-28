@@ -7,7 +7,7 @@ from torch.optim import lr_scheduler as scheduler
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn import functional as F
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 # *transformers
 from transformers import MBartForConditionalGeneration, MBartTokenizer,MBartConfig
@@ -58,6 +58,92 @@ from definition import *
 import torch.autograd.profiler as profiler
 from models.SignCL import SignCL
 cl_criterion = SignCL(max_distance=64.0)
+
+
+class CheckpointableRandomSampler(Sampler):
+    def __init__(self, data_source):
+        self.data_source = data_source
+        self.indices = None
+
+    def __iter__(self):
+        if self.indices is None:
+            self.indices = torch.randperm(len(self.data_source)).tolist()
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def reset(self):
+        self.indices = None
+
+    def state_dict(self):
+        return {'indices': self.indices}
+
+    def load_state_dict(self, state):
+        self.indices = state.get('indices')
+
+
+def _checkpoint_state(model, optimizer, lr_scheduler, text_decoder,
+                      optimizer_td, lr_scheduler_td, loss_scaler, epoch,
+                      batch, min_loss, train_sampler):
+    state = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'lr_scheduler': lr_scheduler.state_dict(),
+        'text_decoder': text_decoder.state_dict(),
+        'optimizer_td': optimizer_td.state_dict(),
+        'lr_scheduler_td': lr_scheduler_td.state_dict(),
+        'epoch': epoch,
+        'batch': batch,
+        'min_loss': min_loss,
+        'train_sampler': train_sampler.state_dict(),
+        'rng_state': {
+            'torch': torch.get_rng_state(),
+            'numpy': np.random.get_state(),
+            'python': random.getstate(),
+        },
+    }
+    if torch.cuda.is_available():
+        state['rng_state']['cuda'] = torch.cuda.get_rng_state_all()
+    if hasattr(loss_scaler, 'state_dict'):
+        state['amp_scaler'] = loss_scaler.state_dict()
+    return state
+
+
+def _save_checkpoint(state, output_dir, filename):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / filename
+    temporary_path = output_dir / f'.{filename}.tmp'
+    torch.save(state, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
+
+
+def _restore_checkpoint(checkpoint, model, optimizer, lr_scheduler,
+                        text_decoder, optimizer_td, lr_scheduler_td,
+                        loss_scaler, train_sampler):
+    model.load_state_dict(checkpoint['model'], strict=True)
+    text_decoder.load_state_dict(checkpoint['text_decoder'], strict=True)
+    if 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    if 'lr_scheduler' in checkpoint:
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+    if 'optimizer_td' in checkpoint:
+        optimizer_td.load_state_dict(checkpoint['optimizer_td'])
+    if 'lr_scheduler_td' in checkpoint:
+        lr_scheduler_td.load_state_dict(checkpoint['lr_scheduler_td'])
+    if 'amp_scaler' in checkpoint and hasattr(loss_scaler, 'load_state_dict'):
+        loss_scaler.load_state_dict(checkpoint['amp_scaler'])
+    rng_state = checkpoint.get('rng_state', {})
+    if 'torch' in rng_state:
+        torch.set_rng_state(rng_state['torch'])
+    if 'numpy' in rng_state:
+        np.random.set_state(rng_state['numpy'])
+    if 'python' in rng_state:
+        random.setstate(rng_state['python'])
+    if torch.cuda.is_available() and 'cuda' in rng_state:
+        torch.cuda.set_rng_state_all(rng_state['cuda'])
+    if 'train_sampler' in checkpoint:
+        train_sampler.load_state_dict(checkpoint['train_sampler'])
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Visual-Language-Pretraining (VLP) scripts', add_help=False)
@@ -155,6 +241,14 @@ def get_args_parser():
     
     # others
     parser.add_argument('--accumulation_step',  type=int, default=1, help="accumulation step for loss backward.")
+    parser.add_argument('--max_train_batches', type=int, default=0,
+                        help='Maximum training batches per epoch; 0 means unlimited.')
+    parser.add_argument('--max_eval_batches', type=int, default=0,
+                        help='Maximum evaluation batches; 0 means unlimited.')
+    parser.add_argument('--debug_only', action='store_true',
+                        help='Stop after bounded training and validation without final evaluation.')
+    parser.add_argument('--checkpoint-interval', type=int, default=250,
+                        help='Save a mid-epoch checkpoint every N completed batches.')
 
     # Code Benchmark: Selection of Model Types
     parser.add_argument("--model_type", type=str, default='gfslt', help="options: gfslt, cico, signcl")
@@ -183,7 +277,7 @@ def main(args, config):
 
     train_data = S2T_Dataset(path=config['data']['train_label_path'], tokenizer = tokenizer, config=config, args=args, phase='train', training_refurbish=True)
     print(train_data)
-    train_sampler = torch.utils.data.RandomSampler(train_data)
+    train_sampler = CheckpointableRandomSampler(train_data)
     train_dataloader = DataLoader(train_data,
                                  batch_size=args.batch_size,
                                  num_workers=args.num_workers,
@@ -264,14 +358,29 @@ def main(args, config):
     loss_scaler = NativeScaler()
 
     output_dir = Path(args.output_dir)
+    min_loss = np.inf
+    resume_batch = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(checkpoint['model'], strict=True)
-        TD_train_dict['text_decoder'].load_state_dict(checkpoint['text_decoder'], strict=True)
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
+        _restore_checkpoint(
+            checkpoint, model, optimizer, lr_scheduler,
+            TD_train_dict['text_decoder'], TD_train_dict['optimizer'],
+            TD_train_dict['lr_scheduler'], loss_scaler, train_sampler,
+        )
+        min_loss = checkpoint.get('min_loss', np.inf)
+        if not args.eval and 'epoch' in checkpoint:
+            if 'batch' not in checkpoint:
+                args.start_epoch = checkpoint['epoch'] + 1
+                train_sampler.reset()
+                resume_batch = 0
+            else:
+                resume_batch = checkpoint.get('batch', 0)
+                if resume_batch >= len(train_dataloader):
+                    args.start_epoch = checkpoint['epoch'] + 1
+                    resume_batch = 0
+                    train_sampler.reset()
+                else:
+                    args.start_epoch = checkpoint['epoch']
 
     if args.eval:
         if not args.resume:
@@ -285,9 +394,15 @@ def main(args, config):
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    min_loss = np.inf
     for epoch in range(args.start_epoch, args.epochs):
-        train_stats = train_one_epoch(args, model, criterion, train_dataloader, optimizer, device, epoch, config, PAD_IDX, loss_scaler, TD_train_dict)
+        if resume_batch == 0:
+            train_sampler.reset()
+        train_stats = train_one_epoch(
+            args, model, criterion, train_dataloader, optimizer, device, epoch,
+            config, PAD_IDX, loss_scaler, TD_train_dict, lr_scheduler, train_sampler,
+            resume_batch, output_dir, min_loss,
+        )
+        resume_batch = 0
         lr_scheduler.step(epoch) 
         TD_train_dict['lr_scheduler'].step(epoch)
         # check min lr
@@ -296,31 +411,23 @@ def main(args, config):
         for param_group in TD_train_dict["optimizer"].param_groups:
             param_group['lr'] = max(param_group['lr'], args.min_lr/10)
 
-        if args.output_dir:
-            checkpoint_paths = [output_dir / f'checkpoint.pth']
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'text_decoder': TD_train_dict['text_decoder'].state_dict(),
-                    'epoch': epoch,
-                }, checkpoint_path)
-
         test_stats = evaluate(args, dev_dataloader, model, criterion, config, epoch, UNK_IDX, SPECIAL_SYMBOLS, PAD_IDX, device, TD_train_dict)
 
-        if min_loss > test_stats["loss"]:
+        improved = min_loss > test_stats["loss"]
+        if improved:
             min_loss = test_stats["loss"]
-            if args.output_dir:
-                checkpoint_paths = [output_dir / 'best_checkpoint.pth']
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'text_decoder': TD_train_dict['text_decoder'].state_dict(),
-                        'epoch': epoch,
-                    }, checkpoint_path)
+
+        if args.output_dir and not args.debug_only and utils.is_main_process():
+            checkpoint_state = _checkpoint_state(
+                model, optimizer, lr_scheduler, TD_train_dict['text_decoder'],
+                TD_train_dict['optimizer'], TD_train_dict['lr_scheduler'],
+                loss_scaler, epoch, len(train_dataloader), min_loss, train_sampler,
+            )
+            _save_checkpoint(checkpoint_state, output_dir, f'checkpoint_epoch_{epoch:04d}.pth')
+            _save_checkpoint(checkpoint_state, output_dir, 'latest_checkpoint.pth')
+            if improved:
+                _save_checkpoint(checkpoint_state, output_dir, f'best_checkpoint_epoch_{epoch:04d}.pth')
+                _save_checkpoint(checkpoint_state, output_dir, 'best_checkpoint.pth')
         
         print(f"* DEV loss {test_stats['loss']:.3f} Min DEV loss {min_loss}")
         if args.run:
@@ -335,6 +442,10 @@ def main(args, config):
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+
+        if args.debug_only:
+            print('DEBUG_ONLY_COMPLETE')
+            return
         
         # Last epoch
     test_on_last_epoch = True
@@ -355,7 +466,8 @@ def main(args, config):
 
 def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, config, PAD_IDX, loss_scaler, TD_train_dict, max_norm: float = 0,
+                    device: torch.device, epoch: int, config, PAD_IDX, loss_scaler, TD_train_dict,
+                    lr_scheduler, train_sampler, resume_batch, output_dir, min_loss, max_norm: float = 0,
                     set_training_mode=True):
     model.train(set_training_mode)
 
@@ -367,6 +479,9 @@ def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss
 
     # with profiler.profile(use_cuda=True) as prof:
     for step, (src_input, tgt_input, masked_tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        if step < resume_batch:
+            continue
+
         optimizer.zero_grad()
         with torch.cuda.amp.autocast():
             logits, ground_truth, frames_feature = model(src_input, tgt_input)
@@ -398,6 +513,17 @@ def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss
             if (step + 1) % args.accumulation_step == 0:
                 loss_scaler(loss=masked_lm_loss, optimizer=TD_train_dict['optimizer'], clip_grad=args.clip_grad, parameters=TD_train_dict['text_decoder'].parameters())
 
+        if args.debug_only and torch.cuda.is_available():
+            print(
+                f'DEBUG_BATCH {step + 1} '
+                f'loss={total_loss.item():.6f} '
+                f'masked_lm_loss={masked_lm_loss.item():.6f} '
+                f'optimizer_step=SUCCESS '
+                f'allocated_mb={torch.cuda.memory_allocated() / 1024**2:.2f} '
+                f'reserved_mb={torch.cuda.memory_reserved() / 1024**2:.2f}',
+                flush=True,
+            )
+
         loss_value = total_loss.item()
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -408,6 +534,28 @@ def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss
 
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(td_lr=TD_train_dict['optimizer'].param_groups[0]["lr"])
+
+        completed_batch = step + 1
+        if (args.output_dir and utils.is_main_process()
+                and args.checkpoint_interval > 0
+                and completed_batch % args.checkpoint_interval == 0):
+            checkpoint_state = _checkpoint_state(
+                model, optimizer, lr_scheduler=lr_scheduler,
+                text_decoder=TD_train_dict['text_decoder'],
+                optimizer_td=TD_train_dict['optimizer'],
+                lr_scheduler_td=TD_train_dict['lr_scheduler'],
+                loss_scaler=loss_scaler, epoch=epoch, batch=completed_batch,
+                min_loss=min_loss, train_sampler=train_sampler,
+            )
+            _save_checkpoint(
+                checkpoint_state, output_dir,
+                f'checkpoint_epoch_{epoch:04d}_batch_{completed_batch:06d}.pth',
+            )
+            _save_checkpoint(checkpoint_state, output_dir, 'latest_checkpoint.pth')
+
+        if args.max_train_batches and step + 1 >= args.max_train_batches:
+            print(f'Maximum training batches reached: {args.max_train_batches}')
+            break
 
     if args.run:
         args.run.log({'epoch':epoch+1,'epoch/train_loss':loss_value, 'epoch/masked_lm_loss':masked_lm_loss.item()})
@@ -446,6 +594,20 @@ def evaluate(args, dev_dataloader, model, criterion, config, epoch, UNK_IDX, SPE
 
             metric_logger.update(loss=total_loss.item())
             metric_logger.update(masked_lm_loss=masked_lm_loss.item())
+
+            if args.debug_only and torch.cuda.is_available():
+                print(
+                    f'DEBUG_EVAL_BATCH {step + 1} '
+                    f'loss={total_loss.item():.6f} '
+                    f'masked_lm_loss={masked_lm_loss.item():.6f} '
+                    f'allocated_mb={torch.cuda.memory_allocated() / 1024**2:.2f} '
+                    f'reserved_mb={torch.cuda.memory_reserved() / 1024**2:.2f}',
+                    flush=True,
+                )
+
+            if args.max_eval_batches and step + 1 >= args.max_eval_batches:
+                print(f'Maximum evaluation batches reached: {args.max_eval_batches}')
+                break
 
 
     if args.run:
@@ -503,6 +665,7 @@ if __name__ == '__main__':
 
     with open(args.config, 'r+',encoding='utf-8') as f:
         config = yaml.load(f,Loader=yaml.FullLoader)
+    config = utils.expand_env_vars(config)
     
     # wandb.init a run if logging, otherwise return None
     args.run = setup_run(args, config)

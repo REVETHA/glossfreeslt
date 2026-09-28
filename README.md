@@ -28,6 +28,88 @@ The following key contributions are implemented:
 
 ---
 
+## Current Project: iSign Workflow
+
+> **Note on Repository Scope:** This repository is based on the benchmark codebase for gloss-free Sign Language Translation and retains original support code and baseline configs for **Phoenix-2014T** and **CSL-Daily**. However, the current active project workflow focuses on the **iSign** dataset (English sign language translation).
+
+### External Dependencies & Storage Policy
+To ensure repository portability and conform to GitHub file size limitations, **no large data or model binaries are tracked in GitHub**:
+- **iSign LMDB Dataset:** External dependency stored locally (NOT tracked in Git).
+- **Prepared mBART Assets (`MBart_trimmed`, `mytran`):** External model artifacts prepared locally (NOT tracked in Git).
+- **Training Checkpoints:** Stored in an external directory outside the repository (NOT tracked in Git).
+
+### Environment Requirements
+- **Python:** 3.9 (tested on Python 3.9.25)
+- **PyTorch:** 2.1.2+cu118
+- **Torchvision:** 0.16.2+cu118
+- **Transformers:** 4.32.0
+- **Tokenizers:** 0.13.3
+- **Hugging Face Hub:** 0.23.4
+- **SentencePiece:** 0.1.97
+- **CUDA:** 11.8
+
+Dependencies can be installed via `pip install -r assets/requirements.txt`.
+
+### Required Environment Variables
+The configuration dynamically resolves paths using environment variables:
+- `ISIGN_LMDB_ROOT`: Root directory containing the iSign LMDB dataset and `labels/` subdirectory (`labels.train`, `labels.dev`, `labels.test`).
+- `MBART_MODELS_ROOT`: Directory containing prepared mBART assets (`MBart_trimmed` and `mytran`).
+
+**Example for current machine (Windows PowerShell):**
+```powershell
+$env:ISIGN_LMDB_ROOT = "D:/iSign_LMDB"
+$env:MBART_MODELS_ROOT = "E:/FINAL YEAR PROJECT/GLOSS FREE SLT/mbart_models"
+```
+
+**Example for Linux / Bash:**
+```bash
+export ISIGN_LMDB_ROOT="/path/to/iSign_LMDB"
+export MBART_MODELS_ROOT="/path/to/mbart_models"
+```
+
+### Configuration
+The portable iSign configuration is located at:
+- `configs/isign/config1.yaml`
+
+Always explicitly pass `--config configs/isign/config1.yaml` when running iSign training or evaluation workflows.
+
+### iSign Smoke Tests
+Before running full training, verify environment setup and model construction using the smoke tests:
+
+1. **Model & Architecture Smoke Test:**
+   ```bash
+   python scripts/isign_model_smoke_test.py
+   ```
+2. **One-Sample End-to-End Pipeline Smoke Test:**
+   ```bash
+   python scripts/isign_one_sample_smoke_test.py
+   ```
+
+### Stage 1: Vision–Language Pretraining (VLP) on iSign
+To launch Stage 1 VLP training with iSign:
+```bash
+python train_vlp.py \
+  --config configs/isign/config1.yaml \
+  --model_type gfslt \
+  --output_dir "E:/iSign_Checkpoints/vlp" \
+  --batch-size 8 \
+  --checkpoint-interval 250
+```
+
+### Checkpointing & Resuming Training
+- **Checkpoint Saving:** Mid-epoch checkpoints are saved periodically via `--checkpoint-interval <N>` (e.g. every 250 completed batches), updating `latest_checkpoint.pth` and saving epoch snapshots to `--output_dir`.
+- **Resuming:** To resume an interrupted training session, pass `--resume`:
+  ```bash
+  python train_vlp.py \
+    --config configs/isign/config1.yaml \
+    --model_type gfslt \
+    --output_dir "E:/iSign_Checkpoints/vlp" \
+    --resume "E:/iSign_Checkpoints/vlp/latest_checkpoint.pth"
+  ```
+  The checkpoint manager restores model parameters, optimizer, learning rate schedulers, epoch counter, batch step, sampler permutation, and RNG state.
+
+---
+
 ## Installation
 
 **Prerequisites:** Python 3.9, a CUDA-enabled GPU.

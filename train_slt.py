@@ -233,7 +233,9 @@ def main(args, config):
 
     global LANGUAGE
     global BLEU_TOKENIZE
-    if not "dataset_name" in config['data'].keys() or config['data']['dataset_name'] == "phoenix":
+    if config['data'].get('language'):
+        LANGUAGE = config['data']['language']
+    elif not "dataset_name" in config['data'].keys() or config['data']['dataset_name'] == "phoenix":
         LANGUAGE = "de_DE"
     else:
         if config['data']['dataset_name'] == "csl-daily":
@@ -723,6 +725,7 @@ if __name__ == '__main__':
 
     with open(args.config, 'r+',encoding='utf-8') as f:
         config = yaml.load(f,Loader=yaml.FullLoader)
+    config = utils.expand_env_vars(config)
     
     os.environ["WANDB_MODE"] = config['training']['wandb'] if not args.eval else 'disabled'
     if utils.is_main_process():

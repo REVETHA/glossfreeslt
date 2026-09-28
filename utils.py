@@ -10,6 +10,7 @@ Misc functions, including distributed helpers.
 
 Mostly copy-paste from torchvision references.
 """
+
 import io
 import os
 import time,random
@@ -610,3 +611,34 @@ def read_lmdb_folder(lmdb_path, folder_name=None):
     images = pickle.loads(images_data)
 
     return images
+
+
+def expand_env_vars(obj):
+    """
+    Recursively expands environment variables in strings, dictionaries, and lists.
+    Supports ${VAR} and $VAR syntax (e.g. ${ISIGN_LMDB_ROOT}/labels/labels.train)
+    as well as ${VAR:-default} fallback syntax.
+    """
+    if isinstance(obj, dict):
+        return {k: expand_env_vars(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [expand_env_vars(v) for v in obj]
+    elif isinstance(obj, str):
+        import re
+        pattern = re.compile(r'\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}|\$([A-Za-z0-9_]+)')
+
+        def _replace(match):
+            var = match.group(1) or match.group(3)
+            default_val = match.group(2)
+            val = os.environ.get(var)
+            if val is not None and val != "":
+                return val
+            if default_val is not None:
+                return default_val
+            raise KeyError(
+                f"Required environment variable '{var}' is not set. "
+                f"Please define it in your environment (e.g. export {var}=... or $env:{var}=...)."
+            )
+
+        return pattern.sub(_replace, obj)
+    return obj
