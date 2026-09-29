@@ -1,8 +1,8 @@
 name: GFSLT-VLP
 data:
-  train_label_path: ${ISIGN_LMDB_ROOT}/labels/labels.train
-  dev_label_path: ${ISIGN_LMDB_ROOT}/labels/labels.dev
-  test_label_path: ${ISIGN_LMDB_ROOT}/labels/labels.test
+  train_label_path: ./data/isign/labels/labels.train
+  dev_label_path: ./data/isign/labels/labels.dev
+  test_label_path: ./data/isign/labels/labels.test
   img_lmdb_path: ${ISIGN_LMDB_ROOT}
   max_length: 128
   dataset_name: isign
