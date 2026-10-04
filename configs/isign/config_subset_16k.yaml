@@ -1,0 +1,18 @@
+name: GFSLT-VLP-iSign-subset-16k
+data:
+  train_label_path: ${ISIGN_LMDB_SUBSET_ROOT}/labels/labels.train
+  dev_label_path: ${ISIGN_LMDB_SUBSET_ROOT}/labels/labels.dev
+  test_label_path: ${ISIGN_LMDB_SUBSET_ROOT}/labels/labels.test
+  img_lmdb_path: ${ISIGN_LMDB_SUBSET_ROOT}
+  max_length: 128
+  dataset_name: isign
+  language: en_XX
+training:
+  wandb: disabled
+  scale_embedding: False
+model:
+  tokenizer: ${MBART_MODELS_ROOT}/MBart_trimmed
+  transformer: ${MBART_MODELS_ROOT}/MBart_trimmed
+  visual_encoder: ${MBART_MODELS_ROOT}/mytran
+  sign_proj: True
+  sign_proj_normalization: LN

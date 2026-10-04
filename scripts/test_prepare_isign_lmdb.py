@@ -13,12 +13,18 @@ import hashlib
 import io
 import pickle
 import shutil
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
 import lmdb
+import numpy as np
 from PIL import Image
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from dataloader.database import ImageDatabase
 from dataloader.datasets import S2T_Dataset
@@ -44,7 +50,25 @@ def read_sample_rows(split_dir: Path) -> list[dict[str, str]]:
 
 
 def frame_digest(image: Image.Image) -> str:
-    return hashlib.sha256(image.tobytes()).hexdigest()
+    image = image.convert("RGB")
+    return hashlib.sha256(np.asarray(image, dtype=np.uint8).tobytes()).hexdigest()
+
+
+def jpeg_payload(image: Image.Image, quality: int = 95) -> bytes:
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG", quality=quality)
+    return encoded.getvalue()
+
+
+def decoded_jpeg_digest(payload: bytes) -> str:
+    image = Image.open(io.BytesIO(payload)).convert("RGB")
+    return frame_digest(image)
+
+
+def decoded_image_matches(reference: Image.Image, decoded: Image.Image) -> bool:
+    ref_array = np.asarray(reference.convert("RGB"), dtype=np.uint8)
+    dec_array = np.asarray(decoded.convert("RGB"), dtype=np.uint8)
+    return ref_array.shape == dec_array.shape and np.array_equal(ref_array, dec_array)
 
 
 def decode_video(video_path: Path) -> tuple[list[Image.Image], dict[str, object]]:
@@ -75,10 +99,8 @@ def write_image_database(path: Path, frames: list[Image.Image], video_name: str)
             transaction.put(b"protocol", pickle.dumps(pickle.DEFAULT_PROTOCOL))
             keys = []
             for index, image in enumerate(frames):
-                encoded = io.BytesIO()
-                image.save(encoded, format="JPEG", quality=95)
                 key = pickle.dumps(index, protocol=pickle.DEFAULT_PROTOCOL)
-                transaction.put(key, encoded.getvalue())
+                transaction.put(key, jpeg_payload(image, quality=95))
                 keys.append(index)
             transaction.put(
                 pickle.dumps("keys", protocol=pickle.DEFAULT_PROTOCOL),
@@ -87,12 +109,18 @@ def write_image_database(path: Path, frames: list[Image.Image], video_name: str)
             transaction.put(b"test_video_name", video_name.encode("utf-8"))
 
 
-def read_database(path: Path) -> tuple[list[Image.Image], list[str]]:
+def read_database(path: Path) -> tuple[list[Image.Image], list[bytes]]:
     database = ImageDatabase(str(path))
-    images = database[list(range(len(database.keys)))]
-    digests = [frame_digest(image.convert("RGB")) for image in images]
+    keys = list(range(len(database.keys)))
+    images = database[keys]
+    raw_payloads: list[bytes] = []
+    with lmdb.open(str(path), readonly=True, lock=False) as environment:
+        with environment.begin() as transaction:
+            for key in keys:
+                raw_key = pickle.dumps(key, protocol=database.protocol)
+                raw_payloads.append(transaction.get(raw_key))
     del database
-    return images, digests
+    return images, raw_payloads
 
 
 def exercise_active_loader(lmdb_root: Path, split: str, uid: str):
@@ -135,14 +163,30 @@ def main() -> None:
             raise FileNotFoundError(f"Missing MP4 for {row['split']} UID {uid}: {video_path}")
 
         frames, metadata = decode_video(video_path)
+        source_payloads = [jpeg_payload(image, quality=95) for image in frames]
         source_digests = [frame_digest(image) for image in frames]
         lmdb_path = output_root / row["split"] / uid
         write_image_database(lmdb_path, frames, uid)
-        images, stored_digests = read_database(lmdb_path)
-        if source_digests != stored_digests:
-            raise AssertionError(f"Frame order/content mismatch for {uid}")
+        images, raw_payloads = read_database(lmdb_path)
         if len(images) != len(frames):
             raise AssertionError(f"Frame count mismatch for {uid}")
+        if source_payloads != raw_payloads:
+            raise AssertionError(f"LMDB JPEG payload mismatch for {uid}")
+        stored_digests = [decoded_jpeg_digest(payload) for payload in raw_payloads]
+        if source_digests != stored_digests:
+            mismatch_index = next(
+                idx for idx, (src, out) in enumerate(zip(source_digests, stored_digests)) if src != out
+            )
+            if not all(
+                decoded_image_matches(reference, decoded)
+                for reference, decoded in zip(frames, images)
+            ):
+                raise AssertionError(
+                    f"LMDB frame content mismatch for {uid} at index {mismatch_index}: "
+                    f"source={source_digests[mismatch_index][:12]}, stored={stored_digests[mismatch_index][:12]}"
+                )
+        if not all(decoded_image_matches(reference, decoded) for reference, decoded in zip(frames, images)):
+            raise AssertionError(f"Decoded LMDB frame pixels differ from source frames in {uid}")
 
         tensor, loader_frame_count = exercise_active_loader(output_root, row["split"], uid)
         if loader_frame_count != len(frames):
